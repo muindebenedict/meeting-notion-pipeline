@@ -6,17 +6,17 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests as ext_requests
 from notion_client import Client as NotionClient
+from supabase import create_client, Client as SupabaseClient
 
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 CORS(app)
 
-FIREFLIES_API_KEY = os.environ.get("FIREFLIES_API_KEY")
-NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
-NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")  # <-- placeholder, set real value in Render env vars only
 
-notion = NotionClient(auth=NOTION_API_KEY) if NOTION_API_KEY else None
+supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 
 @app.route("/api/health", methods=["GET"])
@@ -24,7 +24,15 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
-def fetch_fireflies_summary(meeting_id):
+def get_client_credentials(client_id):
+    """Look up a client's stored credentials from Supabase using their client_id."""
+    result = supabase.table("clients").select("*").eq("client_id", client_id).execute()
+    if not result.data:
+        return None
+    return result.data[0]
+
+
+def fetch_fireflies_summary(meeting_id, fireflies_api_key):
     query = """
     query Transcript($transcriptId: String!) {
         transcript(id: $transcriptId) {
@@ -41,7 +49,7 @@ def fetch_fireflies_summary(meeting_id):
     response = ext_requests.post(
         "https://api.fireflies.ai/graphql",
         headers={
-            "Authorization": f"Bearer {FIREFLIES_API_KEY}",
+            "Authorization": f"Bearer {fireflies_api_key}",
             "Content-Type": "application/json"
         },
         json={"query": query, "variables": {"transcriptId": meeting_id}},
@@ -95,9 +103,11 @@ def text_to_blocks(text, block_type):
     return blocks
 
 
-def push_to_notion(meeting_data, meeting_id):
-    if not meeting_data or not notion:
+def push_to_notion(meeting_data, meeting_id, notion_api_key, notion_database_id):
+    if not meeting_data:
         return None
+
+    notion = NotionClient(auth=notion_api_key)
 
     title = meeting_data.get("title") or "Untitled Meeting"
     summary = meeting_data.get("summary") or {}
@@ -144,31 +154,41 @@ def push_to_notion(meeting_data, meeting_id):
     )
 
     notion.pages.create(
-        parent={"database_id": NOTION_DATABASE_ID},
+        parent={"database_id": notion_database_id},
         properties=properties,
         children=children
     )
 
 
-@app.route("/api/fireflies-webhook", methods=["POST"])
-def fireflies_webhook():
+@app.route("/api/fireflies-webhook/<client_id>", methods=["POST"])
+def fireflies_webhook(client_id):
     try:
         payload = request.get_json(force=True, silent=True)
-        logging.info(f"[Fireflies Webhook] Received at {datetime.utcnow()}: {json.dumps(payload)}")
+        logging.info(f"[Fireflies Webhook] client={client_id} received at {datetime.utcnow()}: {json.dumps(payload)}")
+
+        client = get_client_credentials(client_id)
+        if not client:
+            logging.error(f"[Fireflies Webhook] Unknown client_id: {client_id}")
+            return jsonify({"status": "unknown client"}), 200
 
         event = payload.get("event")
         meeting_id = payload.get("meeting_id")
 
         if event == "meeting.summarized" and meeting_id and meeting_id != "test_00000000":
-            meeting_data = fetch_fireflies_summary(meeting_id)
-            logging.info(f"[Fireflies Webhook] Fetched summary: {json.dumps(meeting_data)}")
-            push_to_notion(meeting_data, meeting_id)
-            logging.info("[Fireflies Webhook] Pushed to Notion successfully")
+            meeting_data = fetch_fireflies_summary(meeting_id, client["fireflies_api_key"])
+            logging.info(f"[Fireflies Webhook] client={client_id} fetched summary: {json.dumps(meeting_data)}")
+            push_to_notion(
+                meeting_data,
+                meeting_id,
+                client["notion_api_key"],
+                client["notion_database_id"]
+            )
+            logging.info(f"[Fireflies Webhook] client={client_id} pushed to Notion successfully")
 
         return jsonify({"status": "received"}), 200
 
     except Exception as e:
-        logging.error(f"[Fireflies Webhook] Error: {e}")
+        logging.error(f"[Fireflies Webhook] client={client_id} error: {e}")
         return jsonify({"status": "error logged"}), 200
 
 
