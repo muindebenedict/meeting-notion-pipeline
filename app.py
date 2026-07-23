@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -194,6 +195,27 @@ def push_to_notion(meeting_data, meeting_id, notion_api_key, notion_database_id)
     )
 
 
+def process_meeting_in_background(client_id, client, meeting_id):
+    """
+    Runs the slow part (fetch summary with retries + push to Notion) on a
+    background thread, completely independent of the webhook request/response
+    cycle, so retries can take as long as they need without Fireflies or
+    Gunicorn timing out the original request.
+    """
+    try:
+        meeting_data = fetch_fireflies_summary(meeting_id, client["fireflies_api_key"])
+        logging.info(f"[Fireflies Background] client={client_id} fetched summary: {json.dumps(meeting_data)}")
+        push_to_notion(
+            meeting_data,
+            meeting_id,
+            client["notion_api_key"],
+            client["notion_database_id"]
+        )
+        logging.info(f"[Fireflies Background] client={client_id} pushed to Notion successfully")
+    except Exception as e:
+        logging.error(f"[Fireflies Background] client={client_id} meeting={meeting_id} failed: {e}")
+
+
 @app.route("/api/fireflies-webhook/<client_id>", methods=["POST"])
 def fireflies_webhook(client_id):
     try:
@@ -209,15 +231,13 @@ def fireflies_webhook(client_id):
         meeting_id = payload.get("meeting_id")
 
         if event == "meeting.summarized" and meeting_id and meeting_id != "test_00000000":
-            meeting_data = fetch_fireflies_summary(meeting_id, client["fireflies_api_key"])
-            logging.info(f"[Fireflies Webhook] client={client_id} fetched summary: {json.dumps(meeting_data)}")
-            push_to_notion(
-                meeting_data,
-                meeting_id,
-                client["notion_api_key"],
-                client["notion_database_id"]
+            thread = threading.Thread(
+                target=process_meeting_in_background,
+                args=(client_id, client, meeting_id),
+                daemon=True
             )
-            logging.info(f"[Fireflies Webhook] client={client_id} pushed to Notion successfully")
+            thread.start()
+            logging.info(f"[Fireflies Webhook] client={client_id} meeting={meeting_id} handed off to background thread")
 
         return jsonify({"status": "received"}), 200
 
