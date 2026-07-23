@@ -34,12 +34,15 @@ def get_client_credentials(client_id):
     return result.data[0]
 
 
-def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=4, initial_delay=8):
+def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=9, initial_delay=8, max_delay=120):
     """
     Fetches the transcript summary for a given meeting_id from Fireflies.
-    Retries with exponential backoff if Fireflies returns an error or an
-    empty summary (common right after the meeting.summarized webhook fires,
-    since the summary can still be writing on Fireflies' side).
+    Retries with exponential backoff (capped at max_delay) if Fireflies
+    returns an error or an empty summary (common right after the
+    meeting.summarized webhook fires, since the summary can still be
+    writing on Fireflies' side — this can occasionally take several
+    minutes). Default settings give roughly a 10-minute total window
+    before giving up: 8s, 16s, 32s, 64s, 120s, 120s, 120s, 120s.
     """
     query = """
     query Transcript($transcriptId: String!) {
@@ -89,7 +92,7 @@ def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=4, initia
 
         if attempt < max_retries:
             time.sleep(delay)
-            delay *= 2  # exponential backoff: 8s, 16s, 32s...
+            delay = min(delay * 2, max_delay)  # exponential backoff, capped at max_delay
 
     logging.error(f"[Fireflies Fetch] meeting={meeting_id} failed after {max_retries} attempts")
     raise RuntimeError(f"Fireflies summary not available for {meeting_id} after {max_retries} retries") from last_error
