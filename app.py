@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import logging
 from datetime import datetime
 from flask import Flask, request, jsonify
@@ -32,7 +33,13 @@ def get_client_credentials(client_id):
     return result.data[0]
 
 
-def fetch_fireflies_summary(meeting_id, fireflies_api_key):
+def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=4, initial_delay=8):
+    """
+    Fetches the transcript summary for a given meeting_id from Fireflies.
+    Retries with exponential backoff if Fireflies returns an error or an
+    empty summary (common right after the meeting.summarized webhook fires,
+    since the summary can still be writing on Fireflies' side).
+    """
     query = """
     query Transcript($transcriptId: String!) {
         transcript(id: $transcriptId) {
@@ -46,18 +53,45 @@ def fetch_fireflies_summary(meeting_id, fireflies_api_key):
         }
     }
     """
-    response = ext_requests.post(
-        "https://api.fireflies.ai/graphql",
-        headers={
-            "Authorization": f"Bearer {fireflies_api_key}",
-            "Content-Type": "application/json"
-        },
-        json={"query": query, "variables": {"transcriptId": meeting_id}},
-        timeout=30
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data.get("data", {}).get("transcript")
+    headers = {
+        "Authorization": f"Bearer {fireflies_api_key}",
+        "Content-Type": "application/json"
+    }
+
+    delay = initial_delay
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = ext_requests.post(
+                "https://api.fireflies.ai/graphql",
+                headers=headers,
+                json={"query": query, "variables": {"transcriptId": meeting_id}},
+                timeout=15
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            transcript = data.get("data", {}).get("transcript")
+            summary = transcript.get("summary") if transcript else None
+
+            if summary and summary.get("overview"):
+                logging.info(f"[Fireflies Fetch] meeting={meeting_id} succeeded on attempt {attempt}")
+                return transcript
+
+            # Got a response but summary isn't ready yet — retry
+            logging.warning(f"[Fireflies Fetch] meeting={meeting_id} summary not ready on attempt {attempt}, retrying in {delay}s")
+
+        except ext_requests.exceptions.RequestException as e:
+            last_error = e
+            logging.warning(f"[Fireflies Fetch] meeting={meeting_id} error on attempt {attempt}: {e}, retrying in {delay}s")
+
+        if attempt < max_retries:
+            time.sleep(delay)
+            delay *= 2  # exponential backoff: 8s, 16s, 32s...
+
+    logging.error(f"[Fireflies Fetch] meeting={meeting_id} failed after {max_retries} attempts")
+    raise RuntimeError(f"Fireflies summary not available for {meeting_id} after {max_retries} retries") from last_error
 
 
 def parse_rich_text(text):
