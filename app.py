@@ -3,7 +3,7 @@ import json
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests as ext_requests
@@ -32,6 +32,120 @@ def get_client_credentials(client_id):
     if not result.data:
         return None
     return result.data[0]
+
+
+# A 'pending' row is a live claim, but the worker holding it dies with the
+# process (deploy, restart, crash). Past this age we assume the worker is gone
+# and let a redelivery take the job over. Keep it comfortably above the worst
+# case runtime of process_meeting_in_background (~12.5 min: fetch_fireflies_summary
+# burns ~10 min of backoff sleeps plus up to 9 x 15s request timeouts, then the
+# Notion write) or a redelivery can steal a job that is still running and write
+# a second Notion page for the meeting.
+STALE_PENDING_AFTER = timedelta(minutes=20)
+
+
+def _claim_age(row):
+    """How long ago the row was last claimed, or None if the timestamp is unreadable."""
+    raw = row.get("updated_at") or row.get("created_at")
+    if not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - stamp
+
+
+def _is_duplicate_key_error(error):
+    """Postgres unique_violation (23505) - another delivery claimed this meeting first."""
+    return getattr(error, "code", None) == "23505" or "23505" in str(error)
+
+
+def claim_meeting_job(client_id, meeting_id):
+    """
+    Reserve a meeting for processing by inserting a 'pending' row in meeting_jobs.
+
+    Returns False when an earlier delivery already claimed it, which is the
+    signal to drop this webhook as a duplicate. Two kinds of row are instead
+    re-claimable, flipped back to 'pending' and processed again:
+
+      - 'failed', so a Fireflies retry can heal a bad run;
+      - 'pending' but older than STALE_PENDING_AFTER, so a job whose worker
+        died with the process does not block the meeting forever.
+
+    Re-claiming writes the row, which bumps updated_at via the database trigger
+    and so re-arms the staleness window for the new worker.
+
+    Bookkeeping never blocks the pipeline: if Supabase fails for any reason
+    other than the unique constraint, we log it and process the meeting anyway.
+    """
+    try:
+        existing = (
+            supabase.table("meeting_jobs")
+            .select("status,updated_at,created_at")
+            .eq("client_id", client_id)
+            .eq("meeting_id", meeting_id)
+            .execute()
+        )
+
+        if existing.data:
+            row = existing.data[0]
+            status = row.get("status")
+            age = _claim_age(row)
+
+            if status == "failed":
+                reason = "an earlier failure"
+            elif status == "pending" and age is not None and age > STALE_PENDING_AFTER:
+                reason = f"a stale pending claim ({int(age.total_seconds() // 60)}m old)"
+            else:
+                age_note = "age unknown" if age is None else f"{int(age.total_seconds())}s old"
+                logging.info(
+                    f"[Meeting Jobs] client={client_id} meeting={meeting_id} "
+                    f"already claimed (status={status}, {age_note})"
+                )
+                return False
+
+            (
+                supabase.table("meeting_jobs")
+                .update({"status": "pending"})
+                .eq("client_id", client_id)
+                .eq("meeting_id", meeting_id)
+                .execute()
+            )
+            logging.info(f"[Meeting Jobs] client={client_id} meeting={meeting_id} re-claimed after {reason}")
+            return True
+
+        supabase.table("meeting_jobs").insert({
+            "client_id": client_id,
+            "meeting_id": meeting_id,
+            "status": "pending"
+        }).execute()
+        return True
+
+    except Exception as e:
+        if _is_duplicate_key_error(e):
+            # Two deliveries raced past the select; the other one won the insert.
+            logging.info(f"[Meeting Jobs] client={client_id} meeting={meeting_id} claimed by a concurrent delivery")
+            return False
+        logging.error(f"[Meeting Jobs] client={client_id} meeting={meeting_id} claim failed: {e}")
+        return True
+
+
+def update_meeting_job(client_id, meeting_id, status):
+    """Mark a job 'success' or 'failed'. updated_at is maintained by a database trigger."""
+    try:
+        (
+            supabase.table("meeting_jobs")
+            .update({"status": status})
+            .eq("client_id", client_id)
+            .eq("meeting_id", meeting_id)
+            .execute()
+        )
+        logging.info(f"[Meeting Jobs] client={client_id} meeting={meeting_id} marked {status}")
+    except Exception as e:
+        logging.error(f"[Meeting Jobs] client={client_id} meeting={meeting_id} could not mark {status}: {e}")
 
 
 def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=9, initial_delay=8, max_delay=120):
@@ -215,8 +329,10 @@ def process_meeting_in_background(client_id, client, meeting_id):
             client["notion_database_id"]
         )
         logging.info(f"[Fireflies Background] client={client_id} pushed to Notion successfully")
+        update_meeting_job(client_id, meeting_id, "success")
     except Exception as e:
         logging.error(f"[Fireflies Background] client={client_id} meeting={meeting_id} failed: {e}")
+        update_meeting_job(client_id, meeting_id, "failed")
 
 
 @app.route("/api/fireflies-webhook/<client_id>", methods=["POST"])
@@ -234,6 +350,10 @@ def fireflies_webhook(client_id):
         meeting_id = payload.get("meeting_id")
 
         if event == "meeting.summarized" and meeting_id and meeting_id != "test_00000000":
+            if not claim_meeting_job(client_id, meeting_id):
+                logging.info(f"[Fireflies Webhook] client={client_id} meeting={meeting_id} duplicate delivery, skipping")
+                return jsonify({"status": "duplicate"}), 200
+
             thread = threading.Thread(
                 target=process_meeting_in_background,
                 args=(client_id, client, meeting_id),
