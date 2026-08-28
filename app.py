@@ -148,6 +148,19 @@ def update_meeting_job(client_id, meeting_id, status):
         logging.error(f"[Meeting Jobs] client={client_id} meeting={meeting_id} could not mark {status}: {e}")
 
 
+# Fireflies error bodies are short, but a stray HTML error page from a proxy is
+# not — cap what we put in the logs.
+MAX_LOGGED_BODY = 2000
+
+
+def _log_body(response):
+    """Response body as a single log-safe line, truncated."""
+    body = " ".join((response.text or "").split())
+    if len(body) > MAX_LOGGED_BODY:
+        return body[:MAX_LOGGED_BODY] + f"... [truncated, {len(body)} chars total]"
+    return body or "<empty body>"
+
+
 def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=9, initial_delay=8, max_delay=120):
     """
     Fetches the transcript summary for a given meeting_id from Fireflies.
@@ -166,7 +179,6 @@ def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=9, initia
             summary {
                 overview
                 action_items
-                keywords
             }
         }
     }
@@ -180,6 +192,7 @@ def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=9, initia
     last_error = None
 
     for attempt in range(1, max_retries + 1):
+        retry_note = f"retrying in {delay}s" if attempt < max_retries else "no attempts left"
         try:
             response = ext_requests.post(
                 "https://api.fireflies.ai/graphql",
@@ -187,10 +200,26 @@ def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=9, initia
                 json={"query": query, "variables": {"transcriptId": meeting_id}},
                 timeout=15
             )
+            # Fireflies puts the real reason (bad key, unknown transcript, plan
+            # limits) in the body, including on 5xx — log it before raise_for_status
+            # throws the response away.
+            if not response.ok:
+                logging.error(
+                    f"[Fireflies Fetch] meeting={meeting_id} HTTP {response.status_code} on attempt {attempt}, "
+                    f"body: {_log_body(response)}"
+                )
             response.raise_for_status()
             data = response.json()
 
-            transcript = data.get("data", {}).get("transcript")
+            # A GraphQL error can also arrive as HTTP 200 with data: null, which
+            # otherwise looks identical to "summary not ready yet".
+            if data.get("errors"):
+                logging.error(
+                    f"[Fireflies Fetch] meeting={meeting_id} GraphQL errors on attempt {attempt}, "
+                    f"body: {_log_body(response)}"
+                )
+
+            transcript = (data.get("data") or {}).get("transcript")
             summary = transcript.get("summary") if transcript else None
 
             if summary and summary.get("overview"):
@@ -198,11 +227,11 @@ def fetch_fireflies_summary(meeting_id, fireflies_api_key, max_retries=9, initia
                 return transcript
 
             # Got a response but summary isn't ready yet — retry
-            logging.warning(f"[Fireflies Fetch] meeting={meeting_id} summary not ready on attempt {attempt}, retrying in {delay}s")
+            logging.warning(f"[Fireflies Fetch] meeting={meeting_id} summary not ready on attempt {attempt}, {retry_note}")
 
         except ext_requests.exceptions.RequestException as e:
             last_error = e
-            logging.warning(f"[Fireflies Fetch] meeting={meeting_id} error on attempt {attempt}: {e}, retrying in {delay}s")
+            logging.warning(f"[Fireflies Fetch] meeting={meeting_id} error on attempt {attempt}: {e}, {retry_note}")
 
         if attempt < max_retries:
             time.sleep(delay)
