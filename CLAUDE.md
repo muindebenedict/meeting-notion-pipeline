@@ -49,4 +49,4 @@ Consequences worth knowing before changing this area: in-flight jobs are still l
 
 ## Logging
 
-All log lines are tagged by stage: `[Fireflies Webhook]`, `[Fireflies Fetch]`, `[Fireflies Background]`, `[Meeting Jobs]`, and include `client=` / `meeting=`. Keep that convention — it is the only way to trace a request once it hands off to the background thread.
+All log lines are tagged by stage: `[Fireflies Webhook]`, `[Fireflies Fetch]`, `[Fireflies Background]`, `[Meeting Jobs]`, and include `client=` / `meeting=`. Keep that convention — it is the only way to trace a request once it hands off to the background thread. Log the *shape* of a summary (title, character counts), never its text: transcripts carry whatever was said in the meeting, and Render retains these logs indefinitely.

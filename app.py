@@ -383,7 +383,16 @@ def process_meeting_in_background(client_id, client, meeting_id):
             )
 
         meeting_data = fetch_fireflies_summary(meeting_id, client["fireflies_api_key"])
-        logging.info(f"[Fireflies Background] client={client_id} fetched summary: {json.dumps(meeting_data)}")
+
+        # Log the shape of what came back, never its content: summaries carry
+        # whatever was said in the meeting, and Render retains these logs.
+        fetched = (meeting_data or {}).get("summary") or {}
+        logging.info(
+            f"[Fireflies Background] client={client_id} meeting={meeting_id} fetched summary: "
+            f"title={(meeting_data or {}).get('title')!r} "
+            f"overview={len(fetched.get('overview') or '')} chars "
+            f"action_items={len(fetched.get('action_items') or '')} chars"
+        )
         push_to_notion(
             meeting_data,
             meeting_id,
