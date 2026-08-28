@@ -34,6 +34,29 @@ def get_client_credentials(client_id):
     return result.data[0]
 
 
+# Every credential a client row must supply before the pipeline can do anything.
+REQUIRED_CLIENT_FIELDS = ("fireflies_api_key", "notion_api_key", "notion_database_id")
+
+# Substrings that mark a column as never filled in. Kept narrow on purpose: a
+# false positive here refuses to process a client that would have worked.
+CREDENTIAL_PLACEHOLDER_HINTS = ("placeholder", "changeme", "change_me")
+
+
+def _looks_unset(value):
+    """True when a credential column is empty or still holds a setup placeholder."""
+    if not isinstance(value, str) or not value.strip():
+        return True
+    lowered = value.strip().lower()
+    if lowered.startswith("your_") or lowered.startswith("<"):
+        return True
+    return any(hint in lowered for hint in CREDENTIAL_PLACEHOLDER_HINTS)
+
+
+def unset_credentials(client):
+    """Names of the credential columns this client row has not really filled in."""
+    return [field for field in REQUIRED_CLIENT_FIELDS if _looks_unset(client.get(field))]
+
+
 # A 'pending' row is a live claim, but the worker holding it dies with the
 # process (deploy, restart, crash). Past this age we assume the worker is gone
 # and let a redelivery take the job over. Keep it comfortably above the worst
@@ -349,6 +372,16 @@ def process_meeting_in_background(client_id, client, meeting_id):
     Gunicorn timing out the original request.
     """
     try:
+        # A row that was never filled in cannot succeed, and retrying it burns the
+        # full ~10 minute Fireflies backoff window before saying so. Fail now, with
+        # the column names, so onboarding mistakes are obvious in the logs.
+        unset = unset_credentials(client)
+        if unset:
+            raise RuntimeError(
+                f"client row has no usable {', '.join(unset)} "
+                f"(empty or still a setup placeholder)"
+            )
+
         meeting_data = fetch_fireflies_summary(meeting_id, client["fireflies_api_key"])
         logging.info(f"[Fireflies Background] client={client_id} fetched summary: {json.dumps(meeting_data)}")
         push_to_notion(
