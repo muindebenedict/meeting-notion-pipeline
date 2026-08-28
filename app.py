@@ -364,6 +364,65 @@ def push_to_notion(meeting_data, meeting_id, notion_api_key, notion_database_id)
     )
 
 
+# Render idles a free instance out after ~15 minutes with no *inbound* HTTP
+# traffic, and a background thread polling Fireflies is not traffic. The webhook
+# answers immediately, so a job can be running with nothing else arriving: worst
+# case fetch_fireflies_summary takes ~12.5 min against a 15 min idle timer, which
+# leaves about 2.5 minutes of margin and no margin at all if the retry window is
+# ever widened. A killed job loses its thread and leaves a 'pending' row that
+# nothing re-drives until Fireflies happens to redeliver.
+#
+# So while any job is in flight, ping our own health endpoint often enough to
+# keep the instance awake. Render publishes the public URL as RENDER_EXTERNAL_URL;
+# with no such variable (local dev) this is inert.
+KEEPALIVE_URL = os.environ.get("RENDER_EXTERNAL_URL")
+KEEPALIVE_INTERVAL = 300  # seconds, comfortably inside the ~15 min idle window
+
+_jobs_lock = threading.Lock()
+_jobs_in_flight = 0
+_keepalive_thread = None
+
+
+def _keepalive_loop():
+    """Ping ourselves every interval until the last in-flight job finishes."""
+    global _keepalive_thread
+    while True:
+        time.sleep(KEEPALIVE_INTERVAL)
+        with _jobs_lock:
+            in_flight = _jobs_in_flight
+            if in_flight <= 0:
+                _keepalive_thread = None
+                logging.info("[Keepalive] no jobs in flight, stopping")
+                return
+        try:
+            ext_requests.get(f"{KEEPALIVE_URL.rstrip('/')}/api/health", timeout=10)
+            logging.info(f"[Keepalive] pinged self, {in_flight} job(s) in flight")
+        except ext_requests.exceptions.RequestException as e:
+            # Losing a ping only costs us the margin it was buying.
+            logging.warning(f"[Keepalive] self ping failed: {e}")
+
+
+def _job_started():
+    """Count a job in, starting the keepalive thread if it is not already running."""
+    global _jobs_in_flight, _keepalive_thread
+    if not KEEPALIVE_URL:
+        return
+    with _jobs_lock:
+        _jobs_in_flight += 1
+        if _keepalive_thread is None or not _keepalive_thread.is_alive():
+            _keepalive_thread = threading.Thread(target=_keepalive_loop, daemon=True)
+            _keepalive_thread.start()
+
+
+def _job_finished():
+    """Count a job out. The keepalive thread stops itself on its next tick."""
+    global _jobs_in_flight
+    if not KEEPALIVE_URL:
+        return
+    with _jobs_lock:
+        _jobs_in_flight = max(0, _jobs_in_flight - 1)
+
+
 def process_meeting_in_background(client_id, client, meeting_id):
     """
     Runs the slow part (fetch summary with retries + push to Notion) on a
@@ -371,6 +430,7 @@ def process_meeting_in_background(client_id, client, meeting_id):
     cycle, so retries can take as long as they need without Fireflies or
     Gunicorn timing out the original request.
     """
+    _job_started()
     try:
         # A row that was never filled in cannot succeed, and retrying it burns the
         # full ~10 minute Fireflies backoff window before saying so. Fail now, with
@@ -404,6 +464,8 @@ def process_meeting_in_background(client_id, client, meeting_id):
     except Exception as e:
         logging.error(f"[Fireflies Background] client={client_id} meeting={meeting_id} failed: {e}")
         update_meeting_job(client_id, meeting_id, "failed")
+    finally:
+        _job_finished()
 
 
 @app.route("/api/fireflies-webhook/<client_id>", methods=["POST"])
